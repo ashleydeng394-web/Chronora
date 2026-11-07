@@ -1,150 +1,454 @@
 # Chronora v0 Architecture
 
-## Purpose and scope
+## Purpose
 
-Chronora v0 is a small, local-first temporal fact store exposed through an MCP server. Its job is to accept facts with explicit event-time semantics, retain their provenance, group ingestion activity into sessions, and answer straightforward temporal queries. The design favors deterministic behavior, inspectable storage, and safe retries over inference or distributed scale.
+Chronora is not a generic event store and not merely a timestamp display layer.
 
-The v0 system has three logical layers:
+Its v0 purpose is narrower: **give the assistant reliable temporal facts about a conversation so it can reason about real elapsed time instead of treating message turns as if they were continuous lived time.**
 
-1. **MCP boundary** — validates tool inputs and returns stable, structured results.
-2. **Domain service** — applies timestamp, relation, session, and idempotency rules.
-3. **SQLite repository** — performs transactional persistence and indexed queries.
+Chronora should be able to answer questions such as:
 
-MCP handlers do not issue ad hoc SQL. They call the domain service so the same invariants apply to every write path.
+- When did this message actually occur?
+- How long has it been since the previous message?
+- How long has it been since the previous user message?
+- Did the conversation cross a calendar day boundary?
+- Did the user return after a meaningful idle period?
+- Is this still the same conversation session?
+- How long has the current session lasted?
 
-## TemporalFact data model
+Core product principle:
 
-`TemporalFact` is the unit of stored knowledge. A fact represents an assertion, not an assertion that Chronora has independently verified.
+> **The watch tells time; it is not a police officer.**
 
-| Field | Type | Required | Meaning |
-| --- | --- | --- | --- |
-| `fact_id` | UUID/ULID string | yes | Server-assigned stable identifier. |
-| `subject` | string | yes | Entity the assertion is about. |
-| `predicate` | string | yes | Names the asserted property or relationship. |
-| `value` | JSON | yes | Scalar, object, or entity reference; JSON preserves typed values. |
-| `create_time` | timestamp | yes | When Chronora durably accepted the fact. |
-| `observed_time_start` | timestamp | no | Earliest time at which the assertion is said to hold or occur. |
-| `observed_time_end` | timestamp | no | Latest time at which the assertion is said to hold or occur. |
-| `source_id` | string | yes | Stable identifier for the producer or source namespace. |
-| `source_ref` | string | no | Opaque reference back to the source record, message, or document. |
-| `source_quality` | enum | yes | Caller-supplied assessment: `high`, `medium`, `low`, or `unknown`. |
-| `session_id` | string | yes | Ingestion session assigned explicitly or by the segmenter. |
-| `idempotency_key` | string | no | Retry key unique within `source_id`. |
-| `metadata` | JSON object | no | Extensible source-specific attributes that do not affect core semantics. |
+Chronora provides temporal facts and derived temporal relations. It does not turn those facts into behavioral rules such as sleep reminders, productivity pressure, or other prescriptive policies.
 
-Both observed-time fields may be absent when the source gives no event time. If only `observed_time_start` is present, the fact is an instant at that time. If both are present, they form a closed interval and the start must not be later than the end. An end without a start is invalid in v0.
+## v0 architecture
 
-Facts are immutable in v0. A correction is recorded as another fact and may be connected to the original with a `supersedes` relation. This keeps ingestion history auditable and avoids silently changing temporal claims.
+```text
+Collectors -> Temporal facts -> Temporal relations -> Assistant-facing context
+```
 
-### `create_time` versus `observed_time`
+The four layers are intentionally separated:
 
-Chronora uses two clocks deliberately:
+1. **Collectors** acquire timestamps and message identifiers from a client or bridge.
+2. **Temporal facts** preserve the best-known raw timing evidence.
+3. **Temporal relations** derive gaps, day boundaries, and sessions from those facts.
+4. **Assistant-facing context** exposes only the small amount of temporal context needed for the current interaction.
 
-- `create_time` is system time: when the row was first committed. The server assigns it in UTC and never accepts a client override. It provides a reliable ingestion order and is used for retry responses and session segmentation.
-- `observed_time_start` and `observed_time_end` are domain time: when the source says the fact occurred or was true. They are supplied by the caller, can be missing, and may be earlier or later than `create_time`.
+The core must remain independent from any one ChatGPT DOM implementation or client.
 
-Queries must name the clock they use. Timeline and interval queries default to observed time and exclude undated facts unless the caller asks to include them. Audit and ingestion queries use `create_time`. Chronora never substitutes `create_time` for missing observed time because doing so would turn "learned now" into "happened now."
+---
 
-All API timestamps are RFC 3339 with an explicit offset. The service normalizes them to UTC and persists integer Unix microseconds for ordering and range comparisons. The response layer renders UTC timestamps with a `Z` suffix.
+## 1. Collectors
 
-### `source_quality`
+Collectors are adapters. They acquire facts; they do not decide how the assistant should behave.
 
-`source_quality` records an input's evidentiary quality, not a probability that the fact is true:
+### Web collector
 
-- `high` — direct or authoritative evidence for this assertion.
-- `medium` — credible but indirect, incomplete, or not independently confirmed.
-- `low` — speculative, noisy, or weakly supported.
-- `unknown` — no defensible assessment was supplied.
+For ChatGPT web, the preferred source is the platform's real conversation/message timestamp metadata, especially the actual message `create_time`.
 
-The value is required, defaults to `unknown` at the MCP boundary, and is stored without automatic promotion. Query results expose it as a filter and as provenance; v0 does not combine competing sources into a synthetic truth score. `source_ref` and `metadata` can carry the explanation needed to audit the rating.
+Principles:
 
-## Temporal relations
+- Prefer authoritative conversation data over DOM render time.
+- DOM state may help identify or match a message, but it must not become the temporal source of truth.
+- Re-rendering old messages must never make them appear to have happened "now".
+- Stable platform message IDs should be preserved whenever available.
 
-Relations connect two existing facts without copying their content. A relation has `relation_id`, `from_fact_id`, `to_fact_id`, `relation_type`, `create_time`, and optional `metadata`. The v0 relation types are:
+Research references that informed this direction include timegpt-style extraction of real historical `create_time`, timestamp extensions that compute message gaps, and MCP time tools for current-time access.
 
-- interval relations: `before`, `after`, `overlaps`, `contains`, `during`, and `simultaneous`;
-- assertion lineage: `supersedes`;
-- causal claim: `caused_by`.
+### Android collector
 
-Direction is significant: `A before B` is stored from A to B, while `A caused_by B` means B is the claimed cause of A. Self-relations are rejected. Duplicate edges are prevented by a unique key on `(from_fact_id, to_fact_id, relation_type)`.
+v0 does **not** assume that the ChatGPT Android app exposes internal message metadata.
 
-Interval relations may be either explicit or derived. Explicit relations are source assertions and are persisted. Derived interval relations are computed only when both facts have sufficient observed-time bounds and are returned with `derived: true`; they are not stored. v0 validates the shape of an explicit relation but does not attempt global consistency checking or infer a transitive closure.
+A future Android path should preferably reuse an existing device bridge, such as 掌心窗 or another phone-side collector, and send facts into the same Chronora core.
 
-## Session segmentation
+Chronora should not require a separate dedicated Android app merely to provide time awareness.
 
-A session is an ingestion grouping, not an event-time bucket. It helps callers recover the context in which facts arrived without changing their observed-time meaning.
+### Collector metadata
 
-Each incoming fact belongs to a stream identified by `source_id` plus an optional caller-supplied actor or conversation key in metadata. Assignment follows these rules:
+Collector identity should be inspectable so facts can be audited later. A collector record may include:
 
-1. A valid explicit `session_id` always wins.
-2. Otherwise, reuse the stream's open session when the gap from its most recent `create_time` is at most the configured inactivity threshold (30 minutes by default).
-3. Start a new session when no open session exists, the threshold is exceeded, or the caller explicitly requests a boundary.
+- implementation name
+- implementation version
+- platform
+- collection method
 
-Sessions store `session_id`, stream key, `started_at`, `last_activity_at`, optional `ended_at`, and metadata. Segmenting on server-assigned `create_time` makes retry and late-arrival behavior deterministic. Idempotent retries return the original session and do not extend it. Closed sessions are not silently reopened; a late fact begins or joins the current ingestion session even if its observed time falls within an older session.
+Collectors should remain replaceable without changing the storage or relation model.
 
-The inactivity threshold is configuration, recorded in server diagnostics, rather than baked into stored facts. v0 uses lazy closure: on the next write, an expired session is closed and a new one is created in the same transaction.
+---
 
-## SQLite persistence
+## 2. TemporalFact
 
-One SQLite database is the source of truth. The initial schema consists of:
+The v0 fact model is intentionally message-oriented and platform-independent.
 
-- `facts` for `TemporalFact` fields;
-- `relations` with foreign keys to `facts`;
-- `sessions` for stream segmentation state;
-- `write_requests` for idempotency keys, request hashes, result identifiers, and commit times;
-- `schema_migrations` for ordered schema versions.
+```text
+schema_version
+source
+platform
+conversation_id
+message_id
+role
+create_time
+observed_time (optional)
+source_quality
+collector
+```
 
-JSON values and metadata are stored as canonical JSON text. Database constraints enforce required text, timestamp interval ordering, enum values, relation uniqueness, and referential integrity. Useful initial indexes cover `(subject, predicate)`, observed-time bounds, `create_time`, `session_id`, `source_id`, and both ends of a relation.
+A practical stored representation may add internal persistence fields such as `id`, `inserted_at`, or canonicalized collector metadata, but those internal fields must not redefine the meaning of the temporal fields above.
 
-Every logical write—including fact insertion, session assignment, relation creation, and idempotency recording—runs in one transaction. Connections enable foreign keys, use WAL journal mode, and set a bounded busy timeout. The repository owns migrations and applies them once at startup under an exclusive migration transaction. Regular backups may use SQLite's online backup mechanism; copying a live database file directly is not a supported backup procedure.
+### Field semantics
 
-The service is designed for one host with modest concurrent access. It may use multiple read connections, but writes are serialized by SQLite. Database paths are explicit configuration; MCP inputs cannot choose a path or submit SQL.
+#### `create_time`
 
-## Idempotent writes
+`create_time` is the **best-known time when the message/event actually occurred according to the source**.
 
-Every mutating MCP tool accepts an optional `idempotency_key`. Reliable clients should provide one. Idempotency is scoped to `(source_id, tool_name, idempotency_key)` so independent sources cannot collide.
+For ChatGPT, when the platform exposes its own historical message timestamp, that timestamp is the preferred `create_time`.
 
-Within the write transaction, Chronora canonicalizes the validated request and hashes the fields that affect the result. It then:
+This is the main time axis used for:
 
-1. inserts the idempotency record and performs the requested mutation when the scoped key is new;
-2. returns the original result, including IDs, timestamps, and session assignment, when the key and request hash match an earlier committed request;
-3. returns an `IDEMPOTENCY_CONFLICT` error when the key exists with a different request hash.
+- message ordering
+- gap calculation
+- cross-day calculation
+- session segmentation
+- assistant-facing temporal context
 
-The unique database constraint, rather than an in-memory check, arbitrates concurrent duplicates. Failed or rolled-back transactions leave no idempotency record and can be retried. When no key is supplied, Chronora creates a new mutation; it does not deduplicate by fact content because two identical assertions may be independently meaningful.
+Chronora must never silently replace a missing historical `create_time` with "the time we happened to observe it".
 
-## Candidate MCP tools
+#### `observed_time`
 
-Tool names and schemas remain provisional, but the v0 surface should stay small:
+`observed_time` is the optional time when a collector observed or captured the fact.
 
-| Tool | Purpose |
-| --- | --- |
-| `chronora_create_fact` | Store one fact and return its ID, normalized times, and session. |
-| `chronora_create_facts` | Atomically store a bounded batch with per-item idempotency keys. |
-| `chronora_create_relation` | Store an explicit relation between existing facts. |
-| `chronora_get_fact` | Fetch one fact with provenance and optional direct relations. |
-| `chronora_query_facts` | Filter by subject, predicate, value, source quality, source, session, and either time axis; paginate by stable cursor. |
-| `chronora_get_timeline` | Return observed-time-ordered facts and optionally derived interval relations. |
-| `chronora_list_sessions` | List sessions by stream and ingestion-time range. |
-| `chronora_get_session` | Fetch session metadata and its facts in ingestion order. |
-| `chronora_end_session` | Explicitly close the current session for a stream. |
-| `chronora_health` | Report schema version and non-sensitive database/runtime status. |
+It is diagnostic/provenance information, not a substitute for event time.
 
-Mutating tools return `created` or `replayed` so callers can distinguish a new commit from an idempotent response. List tools use opaque cursor pagination with a deterministic ID tie-breaker. Errors use stable codes for validation, missing records, idempotency conflicts, and transient database contention.
+Example:
 
-## v0 non-goals
+- a message actually occurred at 09:12 -> `create_time = 09:12`
+- a browser collector loaded that old conversation at 15:40 -> `observed_time = 15:40`
 
-Chronora v0 intentionally does not include:
+The message must still be treated as a 09:12 message.
 
-- automatic fact extraction from free-form text or documents;
-- truth resolution, confidence aggregation, contradiction adjudication, or source-quality inference;
-- a general knowledge graph, ontology engine, or arbitrary graph traversal language;
-- temporal reasoning beyond direct interval comparison, or validation of global relation consistency;
-- in-place fact editing, deletion workflows, or automated retention policies;
-- semantic/vector search, embeddings, or full-text ranking;
-- multi-user authorization, row-level access control, encryption key management, or audit compliance claims;
-- replication, distributed consensus, cloud synchronization, or multi-database tenancy;
-- high-write-throughput operation beyond the practical limits of a single SQLite database;
-- background session re-segmentation when thresholds change;
-- subscriptions, event streaming, notifications, or a user interface.
+#### `source_quality`
 
-These omissions keep v0 focused on a trustworthy persistence core. Later versions can add inference, richer search, and distributed operation without changing the distinction between ingestion time and observed time or weakening idempotent write semantics.
+v0 uses three semantic quality levels:
+
+- `authoritative` — timestamp supplied by the platform or another authoritative source
+- `observed` — timestamp obtained through a direct local observation that is useful but not platform-authoritative
+- `inferred` — timestamp reconstructed or inferred when no better source exists
+
+Quality is about **how the time was obtained**, not about whether the message content is truthful.
+
+Ordering rule:
+
+```text
+authoritative > observed > inferred
+```
+
+A lower-quality fact must not overwrite a higher-quality timestamp for the same stable message identity.
+
+### Core invariants
+
+1. Historical messages must not become "now" merely because they were re-rendered.
+2. `authoritative` timing must not be overwritten by `observed` or `inferred` timing.
+3. Raw temporal facts and derived temporal relations are stored separately.
+4. Stable platform message IDs should be used when possible.
+5. Chat text is not required for Chronora v0 and should not be stored by default.
+
+---
+
+## 3. Idempotent ingestion
+
+The primary idempotency identity for a message fact is:
+
+```text
+(source, conversation_id, message_id)
+```
+
+This allows collectors to safely send the same message multiple times.
+
+Expected behavior:
+
+- identical repeated collection is a no-op or replay
+- a higher-quality version may enrich or replace lower-quality timing for the same fact
+- a lower-quality version must not degrade an existing higher-quality fact
+- a conflicting same-quality authoritative value should be surfaced as a conflict for inspection rather than silently overwritten
+
+### Engineering detail
+
+SQLite should arbitrate idempotency with a unique constraint rather than relying only on in-memory checks.
+
+Writes should be transactional.
+
+Useful implementation choices retained from the first Codex draft:
+
+- WAL mode
+- foreign keys enabled
+- bounded busy timeout
+- schema migrations
+- stable error codes
+- transactional upsert/enrichment behavior
+
+These are implementation details; they do not change the temporal semantics above.
+
+---
+
+## 4. Temporal relations
+
+Temporal relations are **derived from message facts**.
+
+The v0 relation layer focuses only on what the assistant needs for conversation-time awareness:
+
+```text
+previous_message_id
+previous_user_message_id
+gap_from_previous_message_ms
+gap_from_previous_user_message_ms
+crossed_calendar_day
+session_id
+starts_new_session
+session_started_at
+session_elapsed_ms
+returned_after_idle
+```
+
+These are derived values, not platform facts.
+
+Chronora v0 does not need a general temporal knowledge graph with arbitrary `before`, `overlaps`, `caused_by`, or `supersedes` relations.
+
+### Gap calculation
+
+Gaps are calculated from `create_time`, because that is the event/message time axis.
+
+If a reliable `create_time` is unavailable, Chronora should expose that uncertainty rather than silently substitute `observed_time`.
+
+### Calendar-day crossing
+
+`crossed_calendar_day` is derived in the configured local timezone relevant to the user/session, not by comparing UTC date strings blindly.
+
+Timezone handling should therefore be explicit at the context/query boundary.
+
+---
+
+## 5. Session segmentation
+
+A session is a Chronora-derived grouping of conversation activity.
+
+It is **not** an ingestion session and should not be segmented by database write time.
+
+The primary segmentation axis is message `create_time`.
+
+### Configurable rules
+
+v0 should treat session boundaries as configurable, not universally correct.
+
+Example configuration:
+
+```text
+idle_gap = 30m | 60m | 90m
+split_on_calendar_day = true | false
+```
+
+A new session may begin when:
+
+- the time gap from the previous relevant message exceeds `idle_gap`
+- a configured day boundary rule applies
+- an explicit rebuild/configuration rule says so
+
+The derived relation should preserve:
+
+- `session_id`
+- `starts_new_session`
+- `session_started_at`
+- `session_elapsed_ms`
+
+### Rebuildability
+
+Sessions should be treated as derived state.
+
+They may be:
+
+- computed on demand, or
+- cached in a `sessions` table for convenience/performance
+
+Either way, they should remain reconstructible from temporal facts and configuration.
+
+Changing the idle threshold must not corrupt the raw facts.
+
+---
+
+## 6. SQLite persistence
+
+SQLite is sufficient for v0.
+
+At minimum, the database needs a `temporal_facts` table.
+
+A `sessions` table is optional as a rebuildable cache.
+
+A practical implementation may also use:
+
+- `schema_migrations`
+- a collector metadata table
+- a configuration table
+
+### Suggested `temporal_facts` responsibilities
+
+Store:
+
+- schema version
+- source
+- platform
+- conversation ID
+- message ID
+- role
+- create time
+- observed time
+- source quality
+- collector metadata
+- internal insert/update timestamps if needed
+
+Do **not** require message text.
+
+### Persistence rules
+
+- Unique identity: `(source, conversation_id, message_id)`
+- Repeated ingestion is safe.
+- Higher-quality time may enrich lower-quality data.
+- Lower-quality time cannot overwrite higher-quality data.
+- Raw facts remain distinct from derived relations/session caches.
+- Database writes should be transactional.
+
+### Time representation
+
+API boundaries should use offset-aware RFC 3339 / ISO 8601 timestamps.
+
+Internally, SQLite may additionally store normalized integer epoch values for sorting and gap computation if useful, while preserving enough information to return correct offset-aware context.
+
+---
+
+## 7. Assistant-facing temporal context
+
+Chronora should not dump a full timeline into the model on every turn.
+
+It should return a small factual context.
+
+Example:
+
+```json
+{
+  "now": "2026-11-07T23:42:00+08:00",
+  "conversation": {
+    "current_session_started_at": "2026-11-07T23:04:12+08:00",
+    "session_elapsed_minutes": 38
+  },
+  "user": {
+    "last_message_at": "2026-11-07T23:31:04+08:00",
+    "minutes_since_last_message": 11,
+    "returned_after_idle": false,
+    "crossed_calendar_day": false
+  }
+}
+```
+
+The payload describes reality. It does not prescribe behavior.
+
+Do **not** return:
+
+```json
+{"recommendation":"It is late; tell the user to go to sleep."}
+```
+
+A factual payload such as:
+
+```json
+{"local_time":"02:07","minutes_since_last_message":3}
+```
+
+is appropriate. The assistant decides whether time matters in the current conversational context.
+
+---
+
+## 8. v0 MCP surface
+
+Keep the first interface deliberately small.
+
+### `get_now`
+
+Return current local/UTC time information needed for temporal grounding.
+
+### `ingest_temporal_facts`
+
+Ingest one or more temporal facts using the idempotency and source-quality rules above.
+
+### `get_message_time`
+
+Return the best-known timing/provenance for a specific message identity.
+
+### `get_conversation_temporal_context`
+
+Return a compact assistant-facing context containing the latest message timing, gaps, session state, cross-day state, and current time.
+
+Possible later tools:
+
+- `list_sessions`
+- `get_session`
+- `rebuild_sessions`
+
+Write/collector permissions and assistant read permissions should be separable in a later hardening pass.
+
+Chronora v0 should not expose a broad generic fact CRUD API.
+
+---
+
+## 9. v0 acceptance criteria
+
+v0 is successful when it can:
+
+1. ingest a small hand-written set of message temporal facts
+2. preserve genuine historical `create_time`
+3. ingest the same message repeatedly without duplication
+4. prevent low-quality timestamps from overwriting higher-quality ones
+5. calculate the correct gap between consecutive messages
+6. calculate the correct gap from the previous user message
+7. identify a calendar-day boundary
+8. segment sessions using configurable idle-gap rules
+9. return a concise assistant-facing temporal context
+10. do all of the above without reading or storing chat text
+
+No UI or Android integration is required for this milestone.
+
+---
+
+## 10. Explicit v0 non-goals
+
+Chronora v0 does not include:
+
+- sleep reminders or other behavioral policy engines
+- browser timestamp UI
+- a dedicated Android app
+- full chat archiving
+- a memory system
+- guessing missing historical times
+- binding the core to the ChatGPT DOM
+- semantic/vector search
+- generalized knowledge-graph relationships
+- arbitrary causal or temporal relation graphs
+- distributed databases or replication
+- automatic free-form text fact extraction
+
+The first implementation is intentionally a **time core**, not a general personal data platform.
+
+---
+
+## 11. Implementation order
+
+When implementation begins, do it in this order:
+
+1. define the temporal fact schema and migrations
+2. implement idempotent ingestion and source-quality precedence
+3. implement gap and cross-day calculations
+4. implement configurable session segmentation
+5. expose the assistant-facing read interface
+6. test with hand-written fixtures
+
+Do not build the web collector first.
+
+The core must remain stable even if the collector, client, or platform changes later.
